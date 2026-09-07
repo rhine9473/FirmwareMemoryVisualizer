@@ -1,0 +1,31 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Build and Packaging
+build/
+dist/
+*.exe
+*.bin
+*.out
+*.elf
+*.axf
+*.map
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
