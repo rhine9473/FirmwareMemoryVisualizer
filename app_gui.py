@@ -2,11 +2,19 @@
 Firmware Memory Visualizer - Native Desktop GUI (PyQt5)
 Universal memory allocation analyzer for ELF, AXF and MAP files.
 Supports internal SRAM and external PSRAM/SDRAM visual split.
+Features:
+- Firmware Version Diff & Baseline comparison (增减对比)
+- C++ Symbol Demangling toggle (C++符号还原)
+- Cross-toolchain Module attribution (模块/源文件归因)
+- One-click export to HTML / CSV / JSON (离线报表导出)
 """
 
 import os
 import sys
-from typing import Optional, Dict, Any
+import json
+import csv
+import time
+from typing import Optional, Dict, Any, List
 
 from PyQt5.QtCore import Qt, QSize, QRectF
 from PyQt5.QtGui import (
@@ -17,10 +25,15 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QTabWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QLineEdit, QComboBox, QProgressBar,
-    QFrame, QStatusBar, QMessageBox, QAbstractItemView
+    QFrame, QStatusBar, QMessageBox, QAbstractItemView, QMenu, QAction, QCheckBox
 )
 
-from parser import FirmwareParser, format_bytes
+from parser import FirmwareParser, format_bytes, batch_demangle
+
+
+def get_resource_path(relative_path):
+    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
 
 
 class MemoryBarWidget(QWidget):
@@ -128,6 +141,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.current_data: Optional[Dict[str, Any]] = None
+        self.baseline_data: Optional[Dict[str, Any]] = None
         self.init_ui()
 
     def init_ui(self):
@@ -136,14 +150,14 @@ class MainWindow(QMainWindow):
         screen = QApplication.primaryScreen()
         if screen:
             avail = screen.availableGeometry()
-            w = min(1080, max(820, int(avail.width() * 0.76)))
-            h = min(640, max(480, int(avail.height() * 0.72)))
+            w = min(1120, max(840, int(avail.width() * 0.78)))
+            h = min(660, max(500, int(avail.height() * 0.74)))
             self.resize(w, h)
-            self.setMinimumSize(780, 460)
+            self.setMinimumSize(800, 480)
             self.move(avail.x() + (avail.width() - w) // 2, avail.y() + (avail.height() - h) // 2)
         else:
-            self.resize(1000, 600)
-            self.setMinimumSize(780, 460)
+            self.resize(1060, 640)
+            self.setMinimumSize(800, 480)
 
         self.setAcceptDrops(True)
         self.apply_stylesheet()
@@ -159,12 +173,13 @@ class MainWindow(QMainWindow):
         top_box.setObjectName("topBox")
         top_layout = QHBoxLayout(top_box)
         top_layout.setContentsMargins(12, 6, 12, 6)
+        top_layout.setSpacing(8)
 
         self.lbl_file_info = QLabel("请将 <b>.elf</b>、<b>.axf</b> 或 <b>.map</b> 固件文件拖入窗口，或点击右侧按钮打开")
         self.lbl_file_info.setStyleSheet("font-size: 13px; color: #1e293b;")
         top_layout.addWidget(self.lbl_file_info, stretch=1)
 
-        btn_open = QPushButton("📂 打开固件 / Map 文件")
+        btn_open = QPushButton("📂 打开固件")
         btn_open.setObjectName("btnPrimary")
         btn_open.setCursor(Qt.PointingHandCursor)
         btn_open.clicked.connect(self.choose_file)
@@ -177,7 +192,49 @@ class MainWindow(QMainWindow):
         self.btn_reload.setEnabled(False)
         top_layout.addWidget(self.btn_reload)
 
+        # Baseline Diff Buttons
+        self.btn_set_baseline = QPushButton("📌 设为基线")
+        self.btn_set_baseline.setObjectName("btnSecondary")
+        self.btn_set_baseline.setCursor(Qt.PointingHandCursor)
+        self.btn_set_baseline.setToolTip("将当前固件锁定为基线，随后载入新构建产物即可直观对比增减体积")
+        self.btn_set_baseline.clicked.connect(self.set_as_baseline)
+        self.btn_set_baseline.setEnabled(False)
+        top_layout.addWidget(self.btn_set_baseline)
+
+        self.btn_clear_baseline = QPushButton("❌ 取消基线")
+        self.btn_clear_baseline.setObjectName("btnSecondary")
+        self.btn_clear_baseline.setCursor(Qt.PointingHandCursor)
+        self.btn_clear_baseline.clicked.connect(self.clear_baseline)
+        self.btn_clear_baseline.setVisible(False)
+        top_layout.addWidget(self.btn_clear_baseline)
+
+        # Export Dropdown
+        self.btn_export = QPushButton("📤 导出分析 ▾")
+        self.btn_export.setObjectName("btnSecondary")
+        self.btn_export.setCursor(Qt.PointingHandCursor)
+        export_menu = QMenu(self)
+        act_html = export_menu.addAction("🌐 导出交互式网页报告 (*.html)")
+        act_csv = export_menu.addAction("📊 导出符号与模块表 (*.csv)")
+        act_json = export_menu.addAction("📄 导出原始数据 (*.json)")
+        act_html.triggered.connect(self.export_html)
+        act_csv.triggered.connect(self.export_csv)
+        act_json.triggered.connect(self.export_json)
+        self.btn_export.setMenu(export_menu)
+        self.btn_export.setEnabled(False)
+        top_layout.addWidget(self.btn_export)
+
         main_layout.addWidget(top_box)
+
+        # Baseline Alert Banner
+        self.banner_baseline = QFrame()
+        self.banner_baseline.setObjectName("bannerBox")
+        self.banner_baseline.setVisible(False)
+        banner_lay = QHBoxLayout(self.banner_baseline)
+        banner_lay.setContentsMargins(12, 4, 12, 4)
+        self.lbl_banner_text = QLabel("")
+        self.lbl_banner_text.setStyleSheet("font-size: 11px; color: #0369a1; font-weight: 500;")
+        banner_lay.addWidget(self.lbl_banner_text)
+        main_layout.addWidget(self.banner_baseline)
 
         # 2. Gauge Cards: Flash, 片内 SRAM, 片外 RAM
         gauge_layout = QHBoxLayout()
@@ -199,7 +256,7 @@ class MainWindow(QMainWindow):
         self.card_ram_ext, self.lbl_ram_ext_val, self.lbl_ram_ext_bytes, self.lbl_ram_ext_pct, self.prog_ram_ext, self.txt_ram_ext_cap, self.lbl_ram_ext_sub = self.create_gauge_card(
             "片外 RAM (PSRAM / SDRAM)", "#0891b2", "8192"
         )
-        self.card_ram_ext.setVisible(False)  # Hidden until external RAM is detected
+        self.card_ram_ext.setVisible(False)
         gauge_layout.addWidget(self.card_ram_ext)
 
         main_layout.addLayout(gauge_layout)
@@ -247,19 +304,20 @@ class MainWindow(QMainWindow):
         sec_ctrl.addWidget(self.search_sec, stretch=1)
 
         self.cb_sec_filter = QComboBox()
-        self.cb_sec_filter.addItems(["显示全部段", "仅看 Flash 相关段", "仅看片内 RAM 段", "仅看片外 RAM 段", "仅看代码段 (Exec)"])
+        self.cb_sec_filter.addItems(["显示全部段", "仅看 Flash 相关段", "仅看片内 RAM 段", "仅看片外 RAM 段", "仅看代码段 (Exec)", "仅看有变动的段 (Diff)"])
         self.cb_sec_filter.currentIndexChanged.connect(self.filter_sections)
         sec_ctrl.addWidget(self.cb_sec_filter)
         sec_layout.addLayout(sec_ctrl)
 
         self.tbl_sections = QTableWidget()
-        self.tbl_sections.setColumnCount(7)
+        self.tbl_sections.setColumnCount(8)
         self.tbl_sections.setHorizontalHeaderLabels([
-            "序号", "段名称 (Section)", "内存归属类别", "虚拟地址 (VMA)", "大小 (字节)", "格式化大小", "属性 Flags"
+            "序号", "段名称 (Section)", "内存归属类别", "虚拟地址 (VMA)", "大小 (字节)", "格式化大小", "变化量 (Diff)", "属性 Flags"
         ])
         self.tbl_sections.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tbl_sections.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.tbl_sections.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.tbl_sections.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.tbl_sections.setSortingEnabled(True)
         self.tbl_sections.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl_sections.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -275,24 +333,32 @@ class MainWindow(QMainWindow):
 
         sym_ctrl = QHBoxLayout()
         self.search_sym = QLineEdit()
-        self.search_sym.setPlaceholderText("🔍 搜索函数名或全局变量名 (支持实时模糊匹配)...")
+        self.search_sym.setPlaceholderText("🔍 搜索函数名或全局变量名 (支持 C++ 还原名实时检索)...")
         self.search_sym.textChanged.connect(self.filter_symbols)
         sym_ctrl.addWidget(self.search_sym, stretch=1)
 
         self.cb_sym_type = QComboBox()
-        self.cb_sym_type.addItems(["全部符号", "仅看函数 (Functions)", "仅看变量 (Variables)"])
+        self.cb_sym_type.addItems(["全部符号", "仅看函数 (Functions)", "仅看变量 (Variables)", "仅看有变化的符号 (Only Changed)"])
         self.cb_sym_type.currentIndexChanged.connect(self.filter_symbols)
         sym_ctrl.addWidget(self.cb_sym_type)
+
+        self.chk_demangle = QCheckBox("还原 C++ 符号名")
+        self.chk_demangle.setChecked(True)
+        self.chk_demangle.setToolTip("勾选后将自动将编译器混淆的 C++ 符号名（如 _ZN7MyClass4initEv）还原为易读形式（如 MyClass::init()）")
+        self.chk_demangle.toggled.connect(self.populate_symbols)
+        sym_ctrl.addWidget(self.chk_demangle)
+
         sym_layout.addLayout(sym_ctrl)
 
         self.tbl_symbols = QTableWidget()
-        self.tbl_symbols.setColumnCount(7)
+        self.tbl_symbols.setColumnCount(9)
         self.tbl_symbols.setHorizontalHeaderLabels([
-            "排名", "符号名称 (Symbol)", "类型", "所属段 (Section)", "虚拟地址 (VMA)", "大小 (字节)", "格式化大小"
+            "排名", "符号名称 (Symbol)", "类型", "所属段 (Section)", "所属模块 / 文件", "虚拟地址 (VMA)", "大小 (字节)", "格式化大小", "变化量 (Diff)"
         ])
         self.tbl_symbols.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tbl_symbols.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.tbl_symbols.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.tbl_symbols.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.tbl_symbols.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeToContents)
         self.tbl_symbols.setSortingEnabled(True)
         self.tbl_symbols.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl_symbols.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -307,16 +373,18 @@ class MainWindow(QMainWindow):
         mod_layout.setSpacing(8)
 
         self.search_mod = QLineEdit()
-        self.search_mod.setPlaceholderText("🔍 过滤源文件或库模块名称...")
+        self.search_mod.setPlaceholderText("🔍 过滤源文件或库模块名称 (如 main.o, lv_font, libc.a)...")
         self.search_mod.textChanged.connect(self.filter_modules)
         mod_layout.addWidget(self.search_mod)
 
         self.tbl_modules = QTableWidget()
         self.tbl_modules.setColumnCount(7)
         self.tbl_modules.setHorizontalHeaderLabels([
-            "目标模块 / 文件", "Code 代码", "RO 数据", "RW 数据", "ZI 数据", "总 Flash", "总 RAM"
+            "目标模块 / 源文件 (.o / .lib)", "Code 代码", "RO 数据", "RW 数据", "ZI 数据", "总 Flash", "总 RAM"
         ])
         self.tbl_modules.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_modules.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.tbl_modules.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.tbl_modules.setSortingEnabled(True)
         self.tbl_modules.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl_modules.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -328,7 +396,7 @@ class MainWindow(QMainWindow):
         # Status Bar
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("就绪。直接拖入 .elf / .axf / .map 文件即可瞬间完成全量分析。双击任意行可复制符号信息。")
+        self.status.showMessage("就绪。直接拖入 .elf / .axf / .map 文件即可瞬间完成全量分析。双击任意表格项可复制内容。")
 
     def create_gauge_card(self, title: str, color_hex: str, default_cap: str):
         card = QFrame()
@@ -424,6 +492,11 @@ class MainWindow(QMainWindow):
                 border: 1px solid #e2e8f0;
                 border-radius: 8px;
             }
+            QFrame#bannerBox {
+                background-color: #f0f9ff;
+                border: 1px solid #bae6fd;
+                border-radius: 6px;
+            }
             QPushButton#btnPrimary {
                 background-color: #2563eb;
                 color: #ffffff;
@@ -463,6 +536,10 @@ class MainWindow(QMainWindow):
                 border-radius: 6px;
                 padding: 4px 8px;
                 font-size: 12px;
+            }
+            QCheckBox {
+                font-size: 12px;
+                color: #475569;
             }
             QTabWidget::pane {
                 border: 1px solid #e2e8f0;
@@ -507,6 +584,36 @@ class MainWindow(QMainWindow):
                 font-size: 11px;
             }
         """)
+
+    # -------------------------------------------------------------------------
+    # Baseline Diff Mode
+    # -------------------------------------------------------------------------
+    def set_as_baseline(self):
+        if not self.current_data:
+            return
+        self.baseline_data = self.current_data
+        self.btn_clear_baseline.setVisible(True)
+        self.banner_baseline.setVisible(True)
+
+        fl = format_bytes(self.baseline_data.get('flash_total', 0))
+        ram = format_bytes(self.baseline_data.get('ram_internal_total', 0))
+        fn = self.baseline_data.get('file_name', '未命名')
+        self.lbl_banner_text.setText(
+            f"⚖️ 对比基线已锁定: <b>{fn}</b> (Flash: {fl}, 片内RAM: {ram})。现在重新编译并点击【重新解析】，或拖入新固件即可查看增减差异！"
+        )
+        self.status.showMessage(f"已将 {fn} 设定为对比基准！")
+        self.update_gauges()
+        self.populate_sections()
+        self.populate_symbols()
+
+    def clear_baseline(self):
+        self.baseline_data = None
+        self.btn_clear_baseline.setVisible(False)
+        self.banner_baseline.setVisible(False)
+        self.status.showMessage("已清除对比基准，恢复常规统计模式。")
+        self.update_gauges()
+        self.populate_sections()
+        self.populate_symbols()
 
     # -------------------------------------------------------------------------
     # Drag and Drop Handling
@@ -554,6 +661,8 @@ class MainWindow(QMainWindow):
             data = FirmwareParser.parse_file(file_path)
             self.current_data = data
             self.btn_reload.setEnabled(True)
+            self.btn_set_baseline.setEnabled(True)
+            self.btn_export.setEnabled(True)
 
             entry_str = f", 入口: 0x{data['entry']:08X}" if data.get('entry') else ""
             arch_str = f" | 架构: {data['arch']}" if data.get('arch') != 'Unknown' else ""
@@ -597,7 +706,8 @@ class MainWindow(QMainWindow):
                 )
                 self.status.showMessage(f"⚠️ {warn_msg}", 10000)
             else:
-                self.status.showMessage(f"解析成功！共提取 {sec_cnt} 个段，{sym_cnt} 个符号。双击任意表格项可复制内容。")
+                diff_hint = " [对比基准激活中]" if self.baseline_data else ""
+                self.status.showMessage(f"解析成功！共提取 {sec_cnt} 个段，{sym_cnt} 个符号。双击表格项可复制内容。{diff_hint}")
 
         except Exception as e:
             QMessageBox.critical(self, "解析错误", f"解析文件失败:\n{str(e)}")
@@ -610,16 +720,29 @@ class MainWindow(QMainWindow):
         if not self.current_data:
             return
 
+        base_fl = self.baseline_data.get('flash_total') if self.baseline_data else None
+        base_ram = self.baseline_data.get('ram_internal_total') if self.baseline_data else None
+
         # 1. Flash
         flash_used = self.current_data.get('flash_total', 0)
         self.lbl_flash_val.setText(format_bytes(flash_used))
-        self.lbl_flash_bytes.setText(f"({flash_used:,} 字节)")
+        diff_str = ""
+        if base_fl is not None:
+            d = flash_used - base_fl
+            sign = "+" if d > 0 else ""
+            diff_str = f" [基线差: {sign}{format_bytes(d)}]"
+        self.lbl_flash_bytes.setText(f"({flash_used:,} 字节){diff_str}")
         self._calc_gauge(flash_used, self.txt_flash_cap, self.lbl_flash_pct, self.prog_flash, "#2563eb")
 
         # 2. 片内 SRAM
         ram_int_used = self.current_data.get('ram_internal_total', 0)
         self.lbl_ram_int_val.setText(format_bytes(ram_int_used))
-        self.lbl_ram_int_bytes.setText(f"({ram_int_used:,} 字节)")
+        diff_ram_str = ""
+        if base_ram is not None:
+            d = ram_int_used - base_ram
+            sign = "+" if d > 0 else ""
+            diff_ram_str = f" [基线差: {sign}{format_bytes(d)}]"
+        self.lbl_ram_int_bytes.setText(f"({ram_int_used:,} 字节){diff_ram_str}")
         self._calc_gauge(ram_int_used, self.txt_ram_int_cap, self.lbl_ram_int_pct, self.prog_ram_int, "#059669")
 
         # 3. 片外 RAM (PSRAM / SDRAM)
@@ -699,14 +822,20 @@ class MainWindow(QMainWindow):
         self.tbl_sections.setSortingEnabled(False)
         self.tbl_sections.setRowCount(0)
 
-        sections = self.current_data.get('sections', [])
+        # Build baseline section map
+        base_sec_map = {}
+        if self.baseline_data:
+            for s in self.baseline_data.get('sections', []):
+                base_sec_map[s['name']] = s.get('size', 0)
+
+        sections = self.current_data.get('sections', []) if self.current_data else []
         for i, s in enumerate(sections):
             row = self.tbl_sections.rowCount()
             self.tbl_sections.insertRow(row)
 
             cat = s.get('category', '')
             cat_color = "#334155"
-            if "Flash" in cat:
+            if "Flash" in cat and "RAM" not in cat:
                 cat_color = "#2563eb"
             elif "片外" in cat or "PSRAM" in cat or "SDRAM" in cat:
                 cat_color = "#0891b2"
@@ -727,9 +856,33 @@ class MainWindow(QMainWindow):
 
             item_size = NumericTableWidgetItem(s['size'], f"{s['size']:,}")
             item_size_str = QTableWidgetItem(s['size_str'])
+
+            # Diff Column
+            sec_sz = s.get('size', 0)
+            if self.baseline_data:
+                old_sz = base_sec_map.get(s['name'])
+                if old_sz is None:
+                    item_diff = NumericTableWidgetItem(sec_sz, f"[新增] +{format_bytes(sec_sz)}")
+                    item_diff.setForeground(QColor("#dc2626"))
+                    item_diff.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                else:
+                    d = sec_sz - old_sz
+                    if d > 0:
+                        item_diff = NumericTableWidgetItem(d, f"+{format_bytes(d)}")
+                        item_diff.setForeground(QColor("#dc2626"))
+                    elif d < 0:
+                        item_diff = NumericTableWidgetItem(d, f"-{format_bytes(abs(d))}")
+                        item_diff.setForeground(QColor("#16a34a"))
+                    else:
+                        item_diff = NumericTableWidgetItem(0, "-")
+                        item_diff.setForeground(QColor("#94a3b8"))
+            else:
+                item_diff = NumericTableWidgetItem(0, "-")
+                item_diff.setForeground(QColor("#94a3b8"))
+
             item_flags = QTableWidgetItem(s.get('flags', ''))
 
-            for it in [item_idx, item_addr, item_size, item_flags]:
+            for it in [item_idx, item_addr, item_size, item_diff, item_flags]:
                 it.setTextAlignment(Qt.AlignCenter)
 
             self.tbl_sections.setItem(row, 0, item_idx)
@@ -738,7 +891,8 @@ class MainWindow(QMainWindow):
             self.tbl_sections.setItem(row, 3, item_addr)
             self.tbl_sections.setItem(row, 4, item_size)
             self.tbl_sections.setItem(row, 5, item_size_str)
-            self.tbl_sections.setItem(row, 6, item_flags)
+            self.tbl_sections.setItem(row, 6, item_diff)
+            self.tbl_sections.setItem(row, 7, item_flags)
 
         self.tbl_sections.setSortingEnabled(True)
 
@@ -746,14 +900,26 @@ class MainWindow(QMainWindow):
         self.tbl_symbols.setSortingEnabled(False)
         self.tbl_symbols.setRowCount(0)
 
-        symbols = self.current_data.get('symbols', [])
+        use_demangle = self.chk_demangle.isChecked()
+
+        # Build baseline symbol map
+        base_sym_map = {}
+        if self.baseline_data:
+            for sym in self.baseline_data.get('symbols', []):
+                base_sym_map[sym['name']] = sym.get('size', 0)
+
+        symbols = self.current_data.get('symbols', []) if self.current_data else []
         for i, sym in enumerate(symbols):
             row = self.tbl_symbols.rowCount()
             self.tbl_symbols.insertRow(row)
 
             item_rank = NumericTableWidgetItem(i + 1)
-            item_name = QTableWidgetItem(sym['name'])
+
+            disp_name = sym.get('demangled_name', sym['name']) if use_demangle else sym['name']
+            item_name = QTableWidgetItem(disp_name)
             item_name.setFont(QFont("Consolas", 10))
+            if sym.get('demangled_name') != sym['name']:
+                item_name.setToolTip(f"原始混淆名: {sym['name']}")
 
             item_type = QTableWidgetItem(sym['type'])
             if "FUNC" in sym['type']:
@@ -762,22 +928,48 @@ class MainWindow(QMainWindow):
                 item_type.setForeground(QColor("#059669"))
 
             item_sec = QTableWidgetItem(sym.get('section', ''))
+            item_mod = QTableWidgetItem(sym.get('module', ''))
             item_addr = QTableWidgetItem(sym['address_hex'])
             item_addr.setFont(QFont("Consolas", 10))
 
             item_size = NumericTableWidgetItem(sym['size'], f"{sym['size']:,}")
             item_size_str = QTableWidgetItem(sym['size_str'])
 
-            for it in [item_rank, item_addr, item_size, item_type]:
+            # Diff Column
+            sym_sz = sym.get('size', 0)
+            if self.baseline_data:
+                old_sz = base_sym_map.get(sym['name'])
+                if old_sz is None:
+                    item_diff = NumericTableWidgetItem(sym_sz, f"[新增] +{format_bytes(sym_sz)}")
+                    item_diff.setForeground(QColor("#dc2626"))
+                    item_diff.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                else:
+                    d = sym_sz - old_sz
+                    if d > 0:
+                        item_diff = NumericTableWidgetItem(d, f"+{format_bytes(d)}")
+                        item_diff.setForeground(QColor("#dc2626"))
+                    elif d < 0:
+                        item_diff = NumericTableWidgetItem(d, f"-{format_bytes(abs(d))}")
+                        item_diff.setForeground(QColor("#16a34a"))
+                    else:
+                        item_diff = NumericTableWidgetItem(0, "-")
+                        item_diff.setForeground(QColor("#94a3b8"))
+            else:
+                item_diff = NumericTableWidgetItem(0, "-")
+                item_diff.setForeground(QColor("#94a3b8"))
+
+            for it in [item_rank, item_addr, item_size, item_diff, item_type]:
                 it.setTextAlignment(Qt.AlignCenter)
 
             self.tbl_symbols.setItem(row, 0, item_rank)
             self.tbl_symbols.setItem(row, 1, item_name)
             self.tbl_symbols.setItem(row, 2, item_type)
             self.tbl_symbols.setItem(row, 3, item_sec)
-            self.tbl_symbols.setItem(row, 4, item_addr)
-            self.tbl_symbols.setItem(row, 5, item_size)
-            self.tbl_symbols.setItem(row, 6, item_size_str)
+            self.tbl_symbols.setItem(row, 4, item_mod)
+            self.tbl_symbols.setItem(row, 5, item_addr)
+            self.tbl_symbols.setItem(row, 6, item_size)
+            self.tbl_symbols.setItem(row, 7, item_size_str)
+            self.tbl_symbols.setItem(row, 8, item_diff)
 
         self.tbl_symbols.setSortingEnabled(True)
 
@@ -785,18 +977,24 @@ class MainWindow(QMainWindow):
         self.tbl_modules.setSortingEnabled(False)
         self.tbl_modules.setRowCount(0)
 
-        modules = self.current_data.get('modules', {})
+        modules = self.current_data.get('modules', {}) if self.current_data else {}
         for name, m in modules.items():
             row = self.tbl_modules.rowCount()
             self.tbl_modules.insertRow(row)
 
             item_name = QTableWidgetItem(name)
+            item_name.setFont(QFont("Consolas", 10))
             item_code = NumericTableWidgetItem(m['code'], format_bytes(m['code']))
             item_ro = NumericTableWidgetItem(m['ro_data'], format_bytes(m['ro_data']))
             item_rw = NumericTableWidgetItem(m['rw_data'], format_bytes(m['rw_data']))
             item_zi = NumericTableWidgetItem(m['zi_data'], format_bytes(m['zi_data']))
             item_flash = NumericTableWidgetItem(m['flash'], format_bytes(m['flash']))
+            item_flash.setForeground(QColor("#2563eb"))
             item_ram = NumericTableWidgetItem(m['ram'], format_bytes(m['ram']))
+            item_ram.setForeground(QColor("#059669"))
+
+            for it in [item_code, item_ro, item_rw, item_zi, item_flash, item_ram]:
+                it.setTextAlignment(Qt.AlignCenter)
 
             self.tbl_modules.setItem(row, 0, item_name)
             self.tbl_modules.setItem(row, 1, item_code)
@@ -818,7 +1016,8 @@ class MainWindow(QMainWindow):
         for r in range(self.tbl_sections.rowCount()):
             name = self.tbl_sections.item(r, 1).text().lower()
             cat = self.tbl_sections.item(r, 2).text()
-            flags = self.tbl_sections.item(r, 6).text()
+            diff_txt = self.tbl_sections.item(r, 6).text()
+            flags = self.tbl_sections.item(r, 7).text()
 
             match_query = (query in name) if query else True
             match_filter = True
@@ -829,7 +1028,9 @@ class MainWindow(QMainWindow):
             elif filter_type == "仅看片外 RAM 段":
                 match_filter = "片外" in cat or "PSRAM" in cat or "SDRAM" in cat
             elif filter_type == "仅看代码段 (Exec)":
-                match_filter = "X" in flags
+                match_filter = "X" in flags or "Code" in cat
+            elif filter_type == "仅看有变动的段 (Diff)":
+                match_filter = (diff_txt != "-")
 
             self.tbl_sections.setRowHidden(r, not (match_query and match_filter))
 
@@ -839,14 +1040,18 @@ class MainWindow(QMainWindow):
 
         for r in range(self.tbl_symbols.rowCount()):
             name = self.tbl_symbols.item(r, 1).text().lower()
+            tooltip = self.tbl_symbols.item(r, 1).toolTip().lower()
             kind = self.tbl_symbols.item(r, 2).text()
+            diff_txt = self.tbl_symbols.item(r, 8).text()
 
-            match_query = (query in name) if query else True
+            match_query = (query in name or query in tooltip) if query else True
             match_filter = True
             if filter_type == "仅看函数 (Functions)":
                 match_filter = "FUNC" in kind
             elif filter_type == "仅看变量 (Variables)":
                 match_filter = "OBJECT" in kind
+            elif filter_type == "仅看有变化的符号 (Only Changed)":
+                match_filter = (diff_txt != "-")
 
             self.tbl_symbols.setRowHidden(r, not (match_query and match_filter))
 
@@ -859,17 +1064,212 @@ class MainWindow(QMainWindow):
     def on_table_double_clicked(self, index):
         table = self.sender()
         if isinstance(table, QTableWidget):
-            item = table.item(index.row(), 1)
-            addr_item = table.item(index.row(), index.column())
-            if item:
+            name_item = table.item(index.row(), 1)
+            addr_item = table.item(index.row(), 5) if table == self.tbl_symbols else table.item(index.row(), 3)
+            if name_item:
                 clip = QApplication.clipboard()
-                clip.setText(f"{item.text()} ({addr_item.text() if addr_item else ''})")
-                self.status.showMessage(f"已复制到剪贴板: {item.text()}", 3000)
+                clip.setText(f"{name_item.text()} ({addr_item.text() if addr_item else ''})")
+                self.status.showMessage(f"已复制到剪贴板: {name_item.text()}", 3000)
 
+    # -------------------------------------------------------------------------
+    # Report Export Handlers
+    # -------------------------------------------------------------------------
+    def export_html(self):
+        if not self.current_data:
+            return
+        default_name = f"{os.path.splitext(self.current_data['file_name'])[0]}_memory_report.html"
+        save_path, _ = QFileDialog.getSaveFileName(self, "导出交互式 HTML 报告", default_name, "HTML 网页 (*.html)")
+        if not save_path:
+            return
 
-def get_resource_path(relative_path):
-    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base_path, relative_path)
+        d = self.current_data
+        fl_str = format_bytes(d.get('flash_total', 0))
+        ram_int_str = format_bytes(d.get('ram_internal_total', 0))
+        ram_ext_str = format_bytes(d.get('ram_external_total', 0))
+        fl_pct = self.lbl_flash_pct.text()
+        ram_int_pct = self.lbl_ram_int_pct.text()
+        gen_time = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Build Section Table HTML
+        sec_rows = ""
+        for s in d.get('sections', []):
+            sec_rows += f"<tr><td>{s['name']}</td><td>{s.get('category','')}</td><td>{s['address_hex']}</td><td>{s['size']:,}</td><td>{s['size_str']}</td><td>{s.get('flags','')}</td></tr>\n"
+
+        # Build Top 200 Symbols HTML
+        sym_rows = ""
+        for s in d.get('symbols', [])[:250]:
+            name = s.get('demangled_name', s['name'])
+            sym_rows += f"<tr><td>{name}</td><td>{s['type']}</td><td>{s.get('section','')}</td><td>{s.get('module','')}</td><td>{s['address_hex']}</td><td>{s['size']:,}</td><td>{s['size_str']}</td></tr>\n"
+
+        # Build Modules HTML
+        mod_rows = ""
+        for m_name, m in sorted(d.get('modules', {}).items(), key=lambda x: x[1]['flash']+x[1]['ram'], reverse=True):
+            mod_rows += f"<tr><td>{m_name}</td><td>{format_bytes(m['code'])}</td><td>{format_bytes(m['ro_data'])}</td><td>{format_bytes(m['rw_data'])}</td><td>{format_bytes(m['zi_data'])}</td><td><b>{format_bytes(m['flash'])}</b></td><td><b>{format_bytes(m['ram'])}</b></td></tr>\n"
+
+        ext_card_html = ""
+        if d.get('has_external_ram'):
+            ext_name = d.get('external_ram_name', '外扩 RAM')
+            ext_card_html = f"""
+            <div class="card">
+                <div class="card-title">片外 RAM ({ext_name})</div>
+                <div class="card-val val-cyan">{ram_ext_str}</div>
+                <div class="sub">额定: {self.txt_ram_ext_cap.text()} KB | 状态: {self.lbl_ram_ext_sub.text()}</div>
+            </div>
+            """
+
+        html_content = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>固件内存分析报告 - {d['file_name']}</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: #f8fafc; margin: 24px; color: #1e293b; }}
+.header {{ background: white; border-radius: 8px; border: 1px solid #e2e8f0; padding: 18px 24px; margin-bottom: 20px; }}
+.header h1 {{ margin: 0 0 6px 0; font-size: 22px; color: #0f172a; }}
+.header p {{ margin: 0; font-size: 13px; color: #64748b; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px; }}
+.card {{ background: white; border-radius: 8px; border: 1px solid #e2e8f0; padding: 16px 20px; }}
+.card-title {{ font-size: 13px; font-weight: 600; color: #475569; }}
+.card-val {{ font-size: 26px; font-weight: bold; margin: 8px 0; }}
+.val-blue {{ color: #2563eb; }}
+.val-green {{ color: #059669; }}
+.val-cyan {{ color: #0891b2; }}
+.sub {{ font-size: 11px; color: #64748b; }}
+.panel {{ background: white; border-radius: 8px; border: 1px solid #e2e8f0; padding: 20px; margin-bottom: 24px; }}
+.panel h2 {{ margin: 0 0 12px 0; font-size: 16px; color: #1e293b; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }}
+th, td {{ border: 1px solid #e2e8f0; padding: 7px 10px; text-align: left; }}
+th {{ background: #f1f5f9; font-weight: 600; color: #475569; }}
+tr:nth-child(even) {{ background: #f8fafc; }}
+input.filter-box {{ width: 100%; box-sizing: border-box; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; margin-bottom: 12px; }}
+</style>
+<script>
+function filterTable(inputId, tableId) {{
+    var input = document.getElementById(inputId);
+    var filter = input.value.toLowerCase();
+    var rows = document.querySelectorAll('#' + tableId + ' tbody tr');
+    rows.forEach(function(row) {{
+        row.style.display = row.textContent.toLowerCase().includes(filter) ? '' : 'none';
+    }});
+}}
+</script>
+</head>
+<body>
+<div class="header">
+    <h1>📊 嵌入式固件内存分析报告: {d['file_name']}</h1>
+    <p>文件类型: {d['file_type']} | 目标架构: {d['arch']} | 生成时间: {gen_time}</p>
+    <p style="margin-top:4px; font-size:11px; color:#94a3b8;">源路径: {d['file_path']}</p>
+</div>
+
+<div class="grid">
+    <div class="card">
+        <div class="card-title">Flash (ROM 固件占用)</div>
+        <div class="card-val val-blue">{fl_str}</div>
+        <div class="sub">额定: {self.txt_flash_cap.text()} KB | 占用率: <b>{fl_pct}</b></div>
+    </div>
+    <div class="card">
+        <div class="card-title">片内 SRAM (Internal RAM)</div>
+        <div class="card-val val-green">{ram_int_str}</div>
+        <div class="sub">额定: {self.txt_ram_int_cap.text()} KB | 占用率: <b>{ram_int_pct}</b> {self.lbl_ram_int_sub.text()}</div>
+    </div>
+    {ext_card_html}
+</div>
+
+<div class="panel">
+    <h2>📌 内存段构成 (Sections)</h2>
+    <input type="text" id="secInput" class="filter-box" onkeyup="filterTable('secInput', 'secTable')" placeholder="🔍 快速搜索段名称 (如 .text, .data, bss)...">
+    <table id="secTable">
+        <thead>
+            <tr><th>段名称 (Section)</th><th>内存归属类别</th><th>虚拟地址 (VMA)</th><th>大小 (字节)</th><th>格式化大小</th><th>属性 Flags</th></tr>
+        </thead>
+        <tbody>
+            {sec_rows}
+        </tbody>
+    </table>
+</div>
+
+<div class="panel">
+    <h2>🏆 符号体积排行榜 Top 250 (Symbols)</h2>
+    <input type="text" id="symInput" class="filter-box" onkeyup="filterTable('symInput', 'symTable')" placeholder="🔍 快速搜索函数名或全局变量名...">
+    <table id="symTable">
+        <thead>
+            <tr><th>符号名称 (Symbol)</th><th>类型</th><th>所属段</th><th>所属模块 / 源文件</th><th>地址 (VMA)</th><th>大小 (字节)</th><th>格式化大小</th></tr>
+        </thead>
+        <tbody>
+            {sym_rows}
+        </tbody>
+    </table>
+</div>
+
+<div class="panel">
+    <h2>📦 模块与源文件分析 (Modules)</h2>
+    <input type="text" id="modInput" class="filter-box" onkeyup="filterTable('modInput', 'modTable')" placeholder="🔍 快速搜索模块名称...">
+    <table id="modTable">
+        <thead>
+            <tr><th>目标模块 / 源文件</th><th>Code 代码</th><th>RO 数据</th><th>RW 数据</th><th>ZI 数据</th><th>总 Flash</th><th>总 RAM</th></tr>
+        </thead>
+        <tbody>
+            {mod_rows}
+        </tbody>
+    </table>
+</div>
+
+</body>
+</html>
+"""
+        try:
+            with open(save_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            QMessageBox.information(self, "导出成功", f"交互式 HTML 报告已成功导出至:\n{save_path}")
+            self.status.showMessage(f"已导出 HTML 报告: {save_path}", 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"导出 HTML 报告失败: {e}")
+
+    def export_csv(self):
+        if not self.current_data:
+            return
+        default_name = f"{os.path.splitext(self.current_data['file_name'])[0]}_symbols.csv"
+        save_path, _ = QFileDialog.getSaveFileName(self, "导出 CSV 报表", default_name, "CSV 表格 (*.csv)")
+        if not save_path:
+            return
+
+        try:
+            with open(save_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(["排名", "符号名称", "C++还原名", "类型", "所属段", "所属模块/源文件", "虚拟地址", "大小(字节)", "格式化大小"])
+                for i, sym in enumerate(self.current_data.get('symbols', [])):
+                    writer.writerow([
+                        i + 1,
+                        sym['name'],
+                        sym.get('demangled_name', sym['name']),
+                        sym['type'],
+                        sym.get('section', ''),
+                        sym.get('module', ''),
+                        sym['address_hex'],
+                        sym['size'],
+                        sym['size_str']
+                    ])
+            QMessageBox.information(self, "导出成功", f"CSV 报表已成功导出（UTF-8 带BOM，Excel直接打开不乱码）:\n{save_path}")
+            self.status.showMessage(f"已导出 CSV 报表: {save_path}", 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"导出 CSV 失败: {e}")
+
+    def export_json(self):
+        if not self.current_data:
+            return
+        default_name = f"{os.path.splitext(self.current_data['file_name'])[0]}_analysis.json"
+        save_path, _ = QFileDialog.getSaveFileName(self, "导出 JSON 数据", default_name, "JSON 数据 (*.json)")
+        if not save_path:
+            return
+
+        try:
+            with open(save_path, 'w', encoding='utf-8') as f:
+                json.dump(self.current_data, f, ensure_ascii=False, indent=2)
+            QMessageBox.information(self, "导出成功", f"全量 JSON 分析数据已成功保存至:\n{save_path}")
+            self.status.showMessage(f"已导出 JSON 数据: {save_path}", 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"导出 JSON 失败: {e}")
 
 
 def main():

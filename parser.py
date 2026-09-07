@@ -2,11 +2,13 @@
 Firmware Memory Visualizer - Parser Engine
 Supports ELF/AXF binary files and Keil/GCC/TI Linker Map files.
 Supports internal SRAM and external PSRAM/SDRAM split detection.
-Accurate LMA/VMA tracking, non-destructive capacity detection, and robust multi-line map parsing.
+Accurate LMA/VMA tracking, C++ symbol demangling, module attribution, and non-destructive capacity detection.
 """
 
 import os
 import re
+import shutil
+import subprocess
 from typing import Dict, List, Any, Optional, Tuple
 
 try:
@@ -28,15 +30,67 @@ def format_bytes(size: int) -> str:
         return f"{size / (1024 * 1024):.2f} MB"
 
 
+def batch_demangle(names: List[str]) -> Dict[str, str]:
+    """
+    Demangle C++ symbols in batch.
+    Tries c++filt subprocess via stdin first, falls back to pure-Python regex parser.
+    """
+    mangled_names = [n for n in set(names) if n.startswith('_Z')]
+    if not mangled_names:
+        return {n: n for n in names}
+
+    result_map = {n: n for n in names}
+
+    # 1. Try system c++filt or arm-none-eabi-c++filt
+    cxxfilt_bin = shutil.which('c++filt') or shutil.which('arm-none-eabi-c++filt')
+    if cxxfilt_bin:
+        try:
+            input_text = '\n'.join(mangled_names)
+            res = subprocess.run([cxxfilt_bin], input=input_text, capture_output=True, text=True, timeout=2)
+            if res.returncode == 0:
+                out_lines = res.stdout.splitlines()
+                for orig, dem in zip(mangled_names, out_lines):
+                    if dem.strip():
+                        result_map[orig] = dem.strip()
+                return result_map
+        except Exception:
+            pass
+
+    # 2. Pure Python fallback for common Itanium ABI _ZN...E symbols
+    for m in mangled_names:
+        if m.startswith('_ZN'):
+            s = m[3:]
+            parts = []
+            while s and not s.startswith('E'):
+                match = re.match(r'^(\d+)(.*)', s)
+                if match:
+                    length = int(match.group(1))
+                    rest = match.group(2)
+                    parts.append(rest[:length])
+                    s = rest[length:]
+                elif s.startswith('C1') or s.startswith('C2'):
+                    if parts:
+                        parts.append(parts[-1])
+                    s = s[2:]
+                elif s.startswith('D1') or s.startswith('D2'):
+                    if parts:
+                        parts.append('~' + parts[-1])
+                    s = s[2:]
+                else:
+                    break
+            if parts:
+                result_map[m] = f"{'::'.join(parts)}()"
+
+    return result_map
+
+
 def is_external_ram_section(sec_name: str, addr: int) -> bool:
     """Determine if a section belongs to external RAM (PSRAM, SDRAM)."""
     name_l = sec_name.lower()
     if any(k in name_l for k in ['ext_ram', 'psram', 'sdram', 'extram', '.ext_']):
         return True
-    # STM32 FMC / FSMC external memory space (0x60000000 ~ 0xDFFFFFFF)
     if 0x60000000 <= addr < 0xE0000000 and not (0x600fffe8 <= addr <= 0x600fffff):
         return True
-    # ESP32 PSRAM mapped address spaces (excluding flash DROM)
     if (0x3C000000 <= addr < 0x3E000000) or (0x48000000 <= addr < 0x4C000000):
         if 'flash' not in name_l and 'rodata' not in name_l:
             return True
@@ -48,16 +102,12 @@ def is_internal_ram_address(addr: int, sec_name: str = "") -> bool:
     name_l = sec_name.lower()
     if is_external_ram_section(sec_name, addr):
         return False
-    # Standard ARM Cortex-M internal SRAM: 0x20000000 ~ 0x3FFFFFFF
     if 0x20000000 <= addr < 0x40000000:
         return True
-    # ESP32-P4 HP SRAM: 0x4FF00000 ~ 0x4FFFFFFF, TCM: 0x30100000 ~ 0x30200000
     if 0x4FF00000 <= addr < 0x50000000 or 0x30100000 <= addr < 0x30200000:
         return True
-    # ESP32 RTC memory
     if 0x50000000 <= addr < 0x50110000 or 0x600fffe8 <= addr <= 0x600fffff:
         return True
-    # Specific section names
     if any(k in name_l for k in ['dram', 'iram', 'bss', 'stack', 'heap', 'sdata', 'sbss']):
         return True
     return False
@@ -94,7 +144,6 @@ def detect_chip_limits(file_path: str, flash_used: int, ram_int_used: int, ram_e
                        esp_target: Optional[str] = None, map_caps: Optional[Dict[str, int]] = None) -> Tuple[int, int, int, bool, str, str]:
     """
     Auto-detect physical Flash, Internal RAM, and External RAM upper limits in KB.
-    Crucial fix: Never artificially enlarge a confirmed chip capacity to hide overflows!
     Returns: (flash_cap_kb, ram_int_cap_kb, ram_ext_cap_kb, has_ext_ram, ext_ram_name, ram_int_note)
     """
     flash_cap = None
@@ -104,7 +153,6 @@ def detect_chip_limits(file_path: str, flash_used: int, ram_int_used: int, ram_e
     ext_ram_name = ""
     ram_int_note = ""
 
-    # Priority 0: Capacities extracted directly from Linker Map's Memory Configuration
     if map_caps:
         if map_caps.get('flash'):
             flash_cap = map_caps['flash']
@@ -125,7 +173,7 @@ def detect_chip_limits(file_path: str, flash_used: int, ram_int_used: int, ram_e
 
     norm_target = esp_target.upper().replace('-', '').replace('_', '') if esp_target else None
 
-    # Check project_description.json / flasher_args.json for target
+    # Check project_description.json
     for d in [dir_path, parent_dir]:
         desc_file = os.path.join(d, 'project_description.json')
         if not norm_target and os.path.exists(desc_file):
@@ -139,7 +187,7 @@ def detect_chip_limits(file_path: str, flash_used: int, ram_int_used: int, ram_e
             except Exception:
                 pass
 
-    # 1. Check ESP-IDF sdkconfig / project files
+    # 1. Check ESP-IDF sdkconfig
     for d in [dir_path, parent_dir, os.path.dirname(parent_dir)]:
         sdk_file = os.path.join(d, 'sdkconfig')
         if os.path.exists(sdk_file):
@@ -147,7 +195,6 @@ def detect_chip_limits(file_path: str, flash_used: int, ram_int_used: int, ram_e
                 with open(sdk_file, 'r', encoding='utf-8', errors='ignore') as f:
                     sdk_txt = f.read()
 
-                    # Flash Size
                     if not flash_cap:
                         m_f = re.search(r'CONFIG_ESPTOOLPY_FLASHSIZE_([0-9]+)MB=y', sdk_txt)
                         if m_f:
@@ -157,7 +204,6 @@ def detect_chip_limits(file_path: str, flash_used: int, ram_int_used: int, ram_e
                             if m_f2:
                                 flash_cap = int(m_f2.group(1)) * 1024
 
-                    # External PSRAM Detection
                     if 'CONFIG_SPIRAM=y' in sdk_txt:
                         has_ext_ram = True
                         if 'CONFIG_SPIRAM_MODE_OCT=y' in sdk_txt:
@@ -182,7 +228,7 @@ def detect_chip_limits(file_path: str, flash_used: int, ram_int_used: int, ram_e
                 pass
             break
 
-    # 2. Check sibling .map file if not already detected
+    # 2. Check sibling .map file
     map_dram_usable_kb = None
     map_candidates = [base_no_ext + '.map', os.path.join(dir_path, os.path.basename(base_no_ext) + '.map')]
     for map_f in map_candidates:
@@ -331,7 +377,6 @@ class FirmwareParser:
             res.get('map_capacities')
         )
 
-        # Use explicitly detected capacity if parser didn't hard-assign one
         if not res.get('chip_flash_kb'):
             res['chip_flash_kb'] = fl_cap
         if not res.get('chip_internal_ram_kb'):
@@ -418,48 +463,27 @@ class FirmwareParser:
                 category = "Other"
                 sec_lower = sec_name.lower()
 
-                # Filter ESP-IDF dummy alignment sections (only dummy sections)
                 if sec_lower.endswith('.dummy') or sec_lower.endswith('_dummy'):
                     category = "保留 / 内存对齐占位 (Dummy/Reserved)"
                 elif is_alloc:
                     is_ext = is_external_ram_section(sec_name, sh_addr)
                     is_int = is_internal_ram_address(sh_addr, sec_name)
-                    has_separate_lma = (sec_lma != sh_addr and has_file_content)
-
-                    # Account Flash:
-                    # Stored in Flash if it has file content (PROGBITS)
-                    # Exclude sections that are purely host debug/metadata
                     is_flash_stored = has_file_content and not is_debug_or_metadata(sec_name, sh_addr)
 
                     if is_flash_stored:
                         flash_bytes += sh_size
 
-                    # Account RAM:
                     if is_ext:
                         ram_ext_bytes += sh_size
-                        if is_flash_stored:
-                            category = "片外 RAM & Flash (Data/Code)"
-                        else:
-                            category = "片外 RAM (BSS/NOLOAD)"
+                        category = "片外 RAM & Flash (Data/Code)" if is_flash_stored else "片外 RAM (BSS/NOLOAD)"
                     elif is_int:
-                        # In ESP32, flash.rodata and flash.text are XIP from Flash
                         if 'flash.rodata' in sec_lower or 'flash.text' in sec_lower or 'flash.appdesc' in sec_lower or 'flash.init_array' in sec_lower:
-                            if 'rodata' in sec_lower or 'appdesc' in sec_lower:
-                                category = "Flash (RO-Data)"
-                            else:
-                                category = "Flash (Code)"
+                            category = "Flash (RO-Data)" if ('rodata' in sec_lower or 'appdesc' in sec_lower) else "Flash (Code)"
                         else:
                             ram_int_bytes += sh_size
-                            if is_flash_stored:
-                                category = "片内 RAM & Flash (Data/Code)"
-                            else:
-                                category = "片内 RAM (Internal SRAM)"
+                            category = "片内 RAM & Flash (Data/Code)" if is_flash_stored else "片内 RAM (Internal SRAM)"
                     else:
-                        # Resides in Flash
-                        if is_exec:
-                            category = "Flash (Code)"
-                        else:
-                            category = "Flash (RO-Data)"
+                        category = "Flash (Code)" if is_exec else "Flash (RO-Data)"
 
                 elif sec_name.startswith('.debug'):
                     category = "Debug Info"
@@ -483,18 +507,27 @@ class FirmwareParser:
             result['ram_external_total'] = ram_ext_bytes
             result['ram_total'] = ram_int_bytes + ram_ext_bytes
 
-            # Symbols
+            # Symbols & Module Attribution from STT_FILE
             symtab = elf.get_section_by_name('.symtab')
             if symtab and isinstance(symtab, SymbolTableSection):
+                raw_symbols = []
+                current_file = "公共符号 / 启动代码"
+
                 for sym in symtab.iter_symbols():
                     name = sym.name
-                    if name.startswith('IDF_TARGET_'):
-                        result['esp_target'] = name.replace('IDF_TARGET_', '').upper()
+                    st_type = sym['st_info']['type']
                     size = sym['st_size']
                     val = sym['st_value']
-                    st_type = sym['st_info']['type']
                     st_bind = sym['st_info']['bind']
                     shndx = sym['st_shndx']
+
+                    if st_type == 'STT_FILE':
+                        if name:
+                            current_file = os.path.basename(name)
+                        continue
+
+                    if name.startswith('IDF_TARGET_'):
+                        result['esp_target'] = name.replace('IDF_TARGET_', '').upper()
 
                     if not name or size == 0:
                         continue
@@ -507,7 +540,7 @@ class FirmwareParser:
                     elif st_type == 'STT_OBJECT':
                         type_str = "全局/静态变量 (OBJECT)"
 
-                    result['symbols'].append({
+                    raw_symbols.append({
                         'name': name,
                         'size': size,
                         'size_str': format_bytes(size),
@@ -515,10 +548,32 @@ class FirmwareParser:
                         'address_hex': f"0x{val:08X}",
                         'type': type_str,
                         'bind': st_bind,
-                        'section': sec_name
+                        'section': sec_name,
+                        'module': current_file
                     })
 
-            result['symbols'].sort(key=lambda x: x['size'], reverse=True)
+                    # Attribute to module stats
+                    mod_entry = result['modules'].setdefault(current_file, {
+                        'name': current_file, 'code': 0, 'ro_data': 0, 'rw_data': 0, 'zi_data': 0, 'flash': 0, 'ram': 0
+                    })
+                    if st_type == 'STT_FUNC':
+                        mod_entry['code'] += size
+                        mod_entry['flash'] += size
+                    else:
+                        if is_internal_ram_address(val, sec_name) or is_external_ram_section(sec_name, val):
+                            mod_entry['zi_data'] += size
+                            mod_entry['ram'] += size
+                        else:
+                            mod_entry['ro_data'] += size
+                            mod_entry['flash'] += size
+
+                # Batch C++ Demangling
+                demangle_map = batch_demangle([s['name'] for s in raw_symbols])
+                for s in raw_symbols:
+                    s['demangled_name'] = demangle_map.get(s['name'], s['name'])
+
+                raw_symbols.sort(key=lambda x: x['size'], reverse=True)
+                result['symbols'] = raw_symbols
 
         return result
 
@@ -621,6 +676,7 @@ class FirmwareParser:
             r'^\s*([a-zA-Z0-9_$]+)\s+(0x[0-9a-fA-F]+)\s+(?:ARM|Thumb)?\s*(Code|Data)\s+(\d+)\s+(.+)$',
             re.MULTILINE
         )
+        raw_symbols = []
         for sm in sym_pattern.finditer(content):
             s_name = sm.group(1)
             s_addr = int(sm.group(2), 16)
@@ -628,7 +684,7 @@ class FirmwareParser:
             s_size = int(sm.group(4))
             s_obj = sm.group(5).strip()
             if s_size > 0:
-                result['symbols'].append({
+                raw_symbols.append({
                     'name': s_name,
                     'size': s_size,
                     'size_str': format_bytes(s_size),
@@ -636,9 +692,16 @@ class FirmwareParser:
                     'address_hex': f"0x{s_addr:08X}",
                     'type': "函数 (FUNC)" if s_kind == "Code" else "全局/静态变量 (OBJECT)",
                     'bind': 'GLOBAL',
-                    'section': s_obj
+                    'section': s_obj,
+                    'module': s_obj
                 })
-        result['symbols'].sort(key=lambda x: x['size'], reverse=True)
+
+        demangle_map = batch_demangle([s['name'] for s in raw_symbols])
+        for s in raw_symbols:
+            s['demangled_name'] = demangle_map.get(s['name'], s['name'])
+
+        raw_symbols.sort(key=lambda x: x['size'], reverse=True)
+        result['symbols'] = raw_symbols
 
     @staticmethod
     def _parse_ti_map(content: str, result: Dict[str, Any]):
@@ -696,6 +759,7 @@ class FirmwareParser:
         if len(sec_split) > 1:
             sec_body = sec_split[1].split('GLOBAL SYMBOLS')[0]
             pattern = re.compile(r'^\s{10,24}([0-9a-fA-F]{8})\s+([0-9a-fA-F]{8})\s+(.+?)(?:\s+\((.*?)\))?$', re.MULTILINE)
+            raw_symbols = []
             for addr_s, len_s, obj, sym in pattern.findall(sec_body):
                 addr = int(addr_s, 16)
                 length = int(len_s, 16)
@@ -705,7 +769,7 @@ class FirmwareParser:
                     name = re.sub(r'^\.(text|bss|data|rodata)\.', '', name)
 
                     is_func = addr < 0x20000000
-                    result['symbols'].append({
+                    raw_symbols.append({
                         'name': name,
                         'size': length,
                         'size_str': format_bytes(length),
@@ -713,15 +777,31 @@ class FirmwareParser:
                         'address_hex': f"0x{addr:08X}",
                         'type': "函数 (FUNC)" if is_func else "全局/静态变量 (OBJECT)",
                         'bind': 'GLOBAL',
-                        'section': clean_obj
+                        'section': clean_obj,
+                        'module': clean_obj
                     })
 
-            result['symbols'].sort(key=lambda x: x['size'], reverse=True)
+                    mod_name = os.path.basename(clean_obj)
+                    mod_entry = result['modules'].setdefault(mod_name, {
+                        'name': mod_name, 'code': 0, 'ro_data': 0, 'rw_data': 0, 'zi_data': 0, 'flash': 0, 'ram': 0
+                    })
+                    if is_func:
+                        mod_entry['code'] += length
+                        mod_entry['flash'] += length
+                    else:
+                        mod_entry['rw_data'] += length
+                        mod_entry['ram'] += length
+
+            demangle_map = batch_demangle([s['name'] for s in raw_symbols])
+            for s in raw_symbols:
+                s['demangled_name'] = demangle_map.get(s['name'], s['name'])
+
+            raw_symbols.sort(key=lambda x: x['size'], reverse=True)
+            result['symbols'] = raw_symbols
 
     @staticmethod
     def _parse_gcc_map(content: str, result: Dict[str, Any]):
-        """Parse GNU GCC / ESP-IDF Linker Map with multi-line unwrapping and load addresses."""
-        # 1. Parse Memory Configuration if present
+        """Parse GNU GCC / ESP-IDF Linker Map with multi-line unwrapping, module attribution, and load addresses."""
         map_caps = {}
         mem_cfg = re.search(r'Memory Configuration.*?\n\nName\s+Origin\s+Length\s+Attributes\n(.*?)\n\n', content, re.DOTALL)
         if mem_cfg:
@@ -743,7 +823,6 @@ class FirmwareParser:
 
         result['map_capacities'] = map_caps
 
-        # 2. Multi-line unwrapping state machine
         lines = content.splitlines()
         in_map = False
         unwrapped = []
@@ -756,7 +835,6 @@ class FirmwareParser:
             if not in_map:
                 continue
 
-            # Check if line is a wrapped section name alone: e.g. " .text.long_name" or ".long_section"
             m_name_only = re.match(r'^(\s{0,2}\.[a-zA-Z0-9_.\-]+)\s*$', line)
             if m_name_only:
                 pending_name = m_name_only.group(1)
@@ -774,7 +852,6 @@ class FirmwareParser:
 
             unwrapped.append(line)
 
-        # 3. Parse unwrapped output sections and symbols
         out_sec_regex = re.compile(r'^(\.[a-zA-Z0-9_.\-]+)\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)(?:\s+load address\s+(0x[0-9a-fA-F]+))?')
         sub_sec_regex = re.compile(r'^\s+(\.[a-zA-Z0-9_.\-]+)\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+(.+)$')
 
@@ -783,6 +860,7 @@ class FirmwareParser:
         ram_ext_bytes = 0
         sec_idx = 0
         current_sec = None
+        raw_symbols = []
 
         for line in unwrapped:
             m = out_sec_regex.match(line)
@@ -804,7 +882,6 @@ class FirmwareParser:
 
                 cat = "Other"
                 if has_load:
-                    # Stored in Flash, loaded into RAM at boot
                     flash_bytes += size
                     if is_ext:
                         cat = "片外 RAM & Flash (Data/Code)"
@@ -816,12 +893,10 @@ class FirmwareParser:
                     cat = "片外 RAM (PSRAM/SDRAM)"
                     ram_ext_bytes += size
                 elif is_int:
-                    # In ESP-IDF:
                     if 'flash.rodata' in s_lower or 'flash.text' in s_lower or 'flash.appdesc' in s_lower or 'flash.init_array' in s_lower:
                         flash_bytes += size
                         cat = "Flash (RO-Data)" if 'rodata' in s_lower or 'appdesc' in s_lower else "Flash (Code)"
                     elif 'iram' in s_lower or 'data' in s_lower or 'rtc' in s_lower or 'tcm.text' in s_lower or 'tcm.data' in s_lower:
-                        # Stored in Flash, loaded into internal RAM at boot
                         flash_bytes += size
                         ram_int_bytes += size
                         cat = "片内 RAM & Flash (Data/Code)"
@@ -829,7 +904,6 @@ class FirmwareParser:
                         cat = "片内 RAM (Internal SRAM)"
                         ram_int_bytes += size
                 else:
-                    # Flash section (code, rodata, assets, etc.)
                     flash_bytes += size
                     if 'rodata' in s_lower or 'assets' in s_lower or 'appdesc' in s_lower or 'exidx' in s_lower:
                         cat = "Flash (RO-Data)"
@@ -858,7 +932,9 @@ class FirmwareParser:
                 s_obj = sub_m.group(4).strip()
                 if s_size > 0:
                     clean_name = sub_name.split('.')[-1] if '.' in sub_name[1:] else sub_name
-                    result['symbols'].append({
+                    mod_name = os.path.basename(s_obj)
+
+                    raw_symbols.append({
                         'name': clean_name,
                         'size': s_size,
                         'size_str': format_bytes(s_size),
@@ -866,14 +942,42 @@ class FirmwareParser:
                         'address_hex': f"0x{s_addr:08X}",
                         'type': "代码/数据",
                         'bind': 'LOCAL',
-                        'section': f"{current_sec or ''} ({os.path.basename(s_obj)})"
+                        'section': f"{current_sec or ''} ({mod_name})",
+                        'module': mod_name
                     })
+
+                    # Attribute to module breakdown
+                    mod_entry = result['modules'].setdefault(mod_name, {
+                        'name': mod_name, 'code': 0, 'ro_data': 0, 'rw_data': 0, 'zi_data': 0, 'flash': 0, 'ram': 0
+                    })
+                    sub_l = sub_name.lower()
+                    if 'text' in sub_l or 'vector' in sub_l:
+                        mod_entry['code'] += s_size
+                        mod_entry['flash'] += s_size
+                        if 'iram' in sub_l:
+                            mod_entry['ram'] += s_size
+                    elif 'rodata' in sub_l or 'appdesc' in sub_l:
+                        mod_entry['ro_data'] += s_size
+                        mod_entry['flash'] += s_size
+                    elif 'data' in sub_l:
+                        mod_entry['rw_data'] += s_size
+                        mod_entry['flash'] += s_size
+                        mod_entry['ram'] += s_size
+                    elif 'bss' in sub_l:
+                        mod_entry['zi_data'] += s_size
+                        mod_entry['ram'] += s_size
 
         result['flash_total'] = flash_bytes
         result['ram_internal_total'] = ram_int_bytes
         result['ram_external_total'] = ram_ext_bytes
         result['ram_total'] = ram_int_bytes + ram_ext_bytes
-        result['symbols'].sort(key=lambda x: x['size'], reverse=True)
+
+        demangle_map = batch_demangle([s['name'] for s in raw_symbols])
+        for s in raw_symbols:
+            s['demangled_name'] = demangle_map.get(s['name'], s['name'])
+
+        raw_symbols.sort(key=lambda x: x['size'], reverse=True)
+        result['symbols'] = raw_symbols
 
     @staticmethod
     def _parse_generic_map(content: str, result: Dict[str, Any]):
