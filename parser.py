@@ -140,36 +140,96 @@ ESP_CHIP_SPECS = {
 }
 
 
+def detect_esp_partition(file_path: str) -> Optional[Dict[str, Any]]:
+    """
+    Look for ESP-IDF partition table in project:
+    1. partition-table.bin in build directory
+    2. partitions.csv in project root
+    """
+    import struct
+    dir_path = os.path.dirname(os.path.abspath(file_path))
+    parent_dir = os.path.dirname(dir_path)
+
+    # 1. Check partition-table.bin in build
+    for d in [dir_path, parent_dir]:
+        bin_path = os.path.join(d, 'partition_table', 'partition-table.bin')
+        if os.path.exists(bin_path):
+            try:
+                with open(bin_path, 'rb') as f:
+                    data = f.read()
+                for offset in range(0, len(data), 32):
+                    entry = data[offset:offset + 32]
+                    if len(entry) < 32:
+                        break
+                    magic, p_type, subtype, p_offset, p_size = struct.unpack('<HBBII', entry[:12])
+                    if magic == 0x50AA and p_type == 0:  # APP partition
+                        label = entry[12:28].split(b'\x00')[0].decode('utf-8', errors='ignore')
+                        return {
+                            'label': label,
+                            'size_bytes': p_size,
+                            'size_kb': p_size // 1024,
+                            'offset': p_offset,
+                            'offset_hex': f'0x{p_offset:X}'
+                        }
+            except Exception:
+                pass
+
+    # 2. Check partitions.csv in project root
+    for d in [dir_path, parent_dir, os.path.dirname(parent_dir)]:
+        csv_path = os.path.join(d, 'partitions.csv')
+        if os.path.exists(csv_path):
+            try:
+                with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        parts = [p.strip() for p in line.split(',')]
+                        if len(parts) >= 5 and parts[1].lower() == 'app':
+                            raw_sz = parts[4].lower()
+                            sz_bytes = 0
+                            if raw_sz.startswith('0x'):
+                                sz_bytes = int(raw_sz, 16)
+                            elif raw_sz.endswith('m'):
+                                sz_bytes = int(raw_sz[:-1]) * 1024 * 1024
+                            elif raw_sz.endswith('k'):
+                                sz_bytes = int(raw_sz[:-1]) * 1024
+                            else:
+                                sz_bytes = int(raw_sz)
+                            return {
+                                'label': parts[0],
+                                'size_bytes': sz_bytes,
+                                'size_kb': sz_bytes // 1024,
+                                'offset': parts[3],
+                                'offset_hex': parts[3]
+                            }
+            except Exception:
+                pass
+
+    return None
+
+
 def detect_chip_limits(file_path: str, flash_used: int, ram_int_used: int, ram_ext_used: int,
-                       esp_target: Optional[str] = None, map_caps: Optional[Dict[str, int]] = None) -> Tuple[int, int, int, bool, str, str]:
+                       esp_target: Optional[str] = None, map_caps: Optional[Dict[str, int]] = None) -> Tuple[int, int, int, bool, str, str, str]:
     """
     Auto-detect physical Flash, Internal RAM, and External RAM upper limits in KB.
-    Returns: (flash_cap_kb, ram_int_cap_kb, ram_ext_cap_kb, has_ext_ram, ext_ram_name, ram_int_note)
+    Returns: (flash_cap_kb, ram_int_cap_kb, ram_ext_cap_kb, has_ext_ram, ext_ram_name, ram_int_note, flash_sub_note)
     """
     flash_cap = None
+    flash_physical_kb = None
+    flash_sub_note = ""
     ram_int_cap = None
     ram_ext_cap = None
     has_ext_ram = False
     ext_ram_name = ""
     ram_int_note = ""
 
-    if map_caps:
-        if map_caps.get('flash'):
-            flash_cap = map_caps['flash']
-        if map_caps.get('ram_int'):
-            ram_int_cap = map_caps['ram_int']
-        if map_caps.get('ram_ext'):
-            ram_ext_cap = map_caps['ram_ext']
-            has_ext_ram = True
-
-    if ram_ext_used > 0:
-        has_ext_ram = True
-        if not ext_ram_name:
-            ext_ram_name = "外部扩展 RAM"
-
     dir_path = os.path.dirname(os.path.abspath(file_path))
     parent_dir = os.path.dirname(dir_path)
     base_no_ext = os.path.splitext(file_path)[0]
+
+    # Detect ESP App Partition
+    app_part = detect_esp_partition(file_path)
 
     norm_target = esp_target.upper().replace('-', '').replace('_', '') if esp_target else None
 
@@ -296,6 +356,14 @@ def detect_chip_limits(file_path: str, flash_used: int, ram_int_used: int, ram_e
         ram_int_note = f"【IDF可用 {ram_int_cap}KB / 芯片物理 {physical_kb}KB】"
         if not flash_cap:
             flash_cap = 8192 if ('S3' in norm_target or 'P4' in norm_target) else 4096
+        flash_physical_kb = flash_cap
+
+        # If App Partition was detected, use it as the actual Flash budget
+        if app_part:
+            flash_cap = app_part['size_kb']
+            flash_sub_note = f"【分区 [{app_part['label']}]: {app_part['size_kb']}KB / 芯片物理: {flash_physical_kb}KB】"
+        else:
+            flash_sub_note = f"【芯片物理 Flash: {flash_physical_kb}KB】"
 
     # 4. Other Microcontrollers
     if not ram_int_note:
@@ -322,6 +390,7 @@ def detect_chip_limits(file_path: str, flash_used: int, ram_int_used: int, ram_e
                 if not ram_int_cap:
                     ram_int_cap = c_ram
                 ram_int_note = f"【片内 SRAM: {ram_int_cap or c_ram}KB】"
+                flash_sub_note = f"【芯片额定 Flash: {c_fl}KB】"
                 break
 
     # 5. Fallback for completely unknown chips: only guess if NONE was detected
@@ -342,7 +411,10 @@ def detect_chip_limits(file_path: str, flash_used: int, ram_int_used: int, ram_e
     elif not has_ext_ram:
         ram_ext_cap = 0
 
-    return flash_cap, ram_int_cap, ram_ext_cap, has_ext_ram, ext_ram_name, ram_int_note
+    if not flash_sub_note:
+        flash_sub_note = f"【额定 Flash: {flash_cap}KB】"
+
+    return flash_cap, ram_int_cap, ram_ext_cap, has_ext_ram, ext_ram_name, ram_int_note, flash_sub_note
 
 
 class FirmwareParser:
@@ -368,7 +440,7 @@ class FirmwareParser:
                 res = FirmwareParser.parse_map(file_path)
 
         # Smart chip capacity detection
-        fl_cap, ram_int_cap, ram_ext_cap, has_ext, ext_name, int_note = detect_chip_limits(
+        fl_cap, ram_int_cap, ram_ext_cap, has_ext, ext_name, int_note, fl_sub_note = detect_chip_limits(
             file_path,
             res.get('flash_total', 0),
             res.get('ram_internal_total', 0),
@@ -389,6 +461,8 @@ class FirmwareParser:
             res['external_ram_name'] = ext_name
         if not res.get('ram_int_note'):
             res['ram_int_note'] = int_note
+        if not res.get('flash_sub_note'):
+            res['flash_sub_note'] = fl_sub_note
 
         return res
 

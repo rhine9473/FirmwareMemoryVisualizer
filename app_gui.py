@@ -1,8 +1,11 @@
 """
-Firmware Memory Visualizer - Native Desktop GUI (PyQt5)
+Firmware Memory Visualizer - Native Desktop GUI & CLI (PyQt5)
 Universal memory allocation analyzer for ELF, AXF and MAP files.
 Supports internal SRAM and external PSRAM/SDRAM visual split.
 Features:
+- Application Partition Budget detection (应用分区上限精准预警)
+- Headless CLI mode for CI/CD & Automated Budget Gatekeeping (--cli)
+- Copy Markdown Summary to clipboard (一键复制 Markdown 摘要)
 - Firmware Version Diff & Baseline comparison (增减对比)
 - C++ Symbol Demangling toggle (C++符号还原)
 - Cross-toolchain Module attribution (模块/源文件归因)
@@ -14,6 +17,7 @@ import sys
 import json
 import csv
 import time
+import argparse
 from typing import Optional, Dict, Any, List
 
 from PyQt5.QtCore import Qt, QSize, QRectF
@@ -34,6 +38,139 @@ from parser import FirmwareParser, format_bytes, batch_demangle
 def get_resource_path(relative_path):
     base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
+
+
+def generate_html_content(data: Dict[str, Any], fl_cap: str, ram_int_cap: str, ram_ext_cap: str,
+                          fl_pct: str, ram_int_pct: str, fl_sub: str, ram_int_sub: str, ext_sub: str) -> str:
+    """Generate standalone interactive HTML report."""
+    fl_str = format_bytes(data.get('flash_total', 0))
+    ram_int_str = format_bytes(data.get('ram_internal_total', 0))
+    ram_ext_str = format_bytes(data.get('ram_external_total', 0))
+    gen_time = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    sec_rows = ""
+    for s in data.get('sections', []):
+        sec_rows += f"<tr><td>{s['name']}</td><td>{s.get('category','')}</td><td>{s['address_hex']}</td><td>{s['size']:,}</td><td>{s['size_str']}</td><td>{s.get('flags','')}</td></tr>\n"
+
+    sym_rows = ""
+    for s in data.get('symbols', [])[:300]:
+        name = s.get('demangled_name', s['name'])
+        sym_rows += f"<tr><td>{name}</td><td>{s['type']}</td><td>{s.get('section','')}</td><td>{s.get('module','')}</td><td>{s['address_hex']}</td><td>{s['size']:,}</td><td>{s['size_str']}</td></tr>\n"
+
+    mod_rows = ""
+    for m_name, m in sorted(data.get('modules', {}).items(), key=lambda x: x[1]['flash'] + x[1]['ram'], reverse=True):
+        mod_rows += f"<tr><td>{m_name}</td><td>{format_bytes(m['code'])}</td><td>{format_bytes(m['ro_data'])}</td><td>{format_bytes(m['rw_data'])}</td><td>{format_bytes(m['zi_data'])}</td><td><b>{format_bytes(m['flash'])}</b></td><td><b>{format_bytes(m['ram'])}</b></td></tr>\n"
+
+    ext_card_html = ""
+    if data.get('has_external_ram'):
+        ext_name = data.get('external_ram_name', '外扩 RAM')
+        ext_card_html = f"""
+        <div class="card">
+            <div class="card-title">片外 RAM ({ext_name})</div>
+            <div class="card-val val-cyan">{ram_ext_str}</div>
+            <div class="sub">额定: {ram_ext_cap} KB | 状态: {ext_sub}</div>
+        </div>
+        """
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>固件内存分析报告 - {data['file_name']}</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; background: #f8fafc; margin: 24px; color: #1e293b; }}
+.header {{ background: white; border-radius: 8px; border: 1px solid #e2e8f0; padding: 18px 24px; margin-bottom: 20px; }}
+.header h1 {{ margin: 0 0 6px 0; font-size: 22px; color: #0f172a; }}
+.header p {{ margin: 0; font-size: 13px; color: #64748b; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px; }}
+.card {{ background: white; border-radius: 8px; border: 1px solid #e2e8f0; padding: 16px 20px; }}
+.card-title {{ font-size: 13px; font-weight: 600; color: #475569; }}
+.card-val {{ font-size: 26px; font-weight: bold; margin: 8px 0; }}
+.val-blue {{ color: #2563eb; }}
+.val-green {{ color: #059669; }}
+.val-cyan {{ color: #0891b2; }}
+.sub {{ font-size: 11px; color: #64748b; }}
+.panel {{ background: white; border-radius: 8px; border: 1px solid #e2e8f0; padding: 20px; margin-bottom: 24px; }}
+.panel h2 {{ margin: 0 0 12px 0; font-size: 16px; color: #1e293b; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }}
+th, td {{ border: 1px solid #e2e8f0; padding: 7px 10px; text-align: left; }}
+th {{ background: #f1f5f9; font-weight: 600; color: #475569; }}
+tr:nth-child(even) {{ background: #f8fafc; }}
+input.filter-box {{ width: 100%; box-sizing: border-box; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; margin-bottom: 12px; }}
+</style>
+<script>
+function filterTable(inputId, tableId) {{
+    var input = document.getElementById(inputId);
+    var filter = input.value.toLowerCase();
+    var rows = document.querySelectorAll('#' + tableId + ' tbody tr');
+    rows.forEach(function(row) {{
+        row.style.display = row.textContent.toLowerCase().includes(filter) ? '' : 'none';
+    }});
+}}
+</script>
+</head>
+<body>
+<div class="header">
+    <h1>📊 嵌入式固件内存分析报告: {data['file_name']}</h1>
+    <p>文件类型: {data['file_type']} | 目标架构: {data['arch']} | 生成时间: {gen_time}</p>
+    <p style="margin-top:4px; font-size:11px; color:#94a3b8;">源路径: {data['file_path']}</p>
+</div>
+
+<div class="grid">
+    <div class="card">
+        <div class="card-title">Flash (ROM 固件占用)</div>
+        <div class="card-val val-blue">{fl_str}</div>
+        <div class="sub">额定/预算: {fl_cap} KB | 占用率: <b>{fl_pct}</b> {fl_sub}</div>
+    </div>
+    <div class="card">
+        <div class="card-title">片内 SRAM (Internal RAM)</div>
+        <div class="card-val val-green">{ram_int_str}</div>
+        <div class="sub">额定: {ram_int_cap} KB | 占用率: <b>{ram_int_pct}</b> {ram_int_sub}</div>
+    </div>
+    {ext_card_html}
+</div>
+
+<div class="panel">
+    <h2>📌 内存段构成 (Sections)</h2>
+    <input type="text" id="secInput" class="filter-box" onkeyup="filterTable('secInput', 'secTable')" placeholder="🔍 快速搜索段名称 (如 .text, .data, bss)...">
+    <table id="secTable">
+        <thead>
+            <tr><th>段名称 (Section)</th><th>内存归属类别</th><th>虚拟地址 (VMA)</th><th>大小 (字节)</th><th>格式化大小</th><th>属性 Flags</th></tr>
+        </thead>
+        <tbody>
+            {sec_rows}
+        </tbody>
+    </table>
+</div>
+
+<div class="panel">
+    <h2>🏆 符号体积排行榜 Top 300 (Symbols)</h2>
+    <input type="text" id="symInput" class="filter-box" onkeyup="filterTable('symInput', 'symTable')" placeholder="🔍 快速搜索函数名或全局变量名...">
+    <table id="symTable">
+        <thead>
+            <tr><th>符号名称 (Symbol)</th><th>类型</th><th>所属段</th><th>所属模块 / 源文件</th><th>地址 (VMA)</th><th>大小 (字节)</th><th>格式化大小</th></tr>
+        </thead>
+        <tbody>
+            {sym_rows}
+        </tbody>
+    </table>
+</div>
+
+<div class="panel">
+    <h2>📦 模块与源文件分析 (Modules)</h2>
+    <input type="text" id="modInput" class="filter-box" onkeyup="filterTable('modInput', 'modTable')" placeholder="🔍 快速搜索模块名称...">
+    <table id="modTable">
+        <thead>
+            <tr><th>目标模块 / 源文件</th><th>Code 代码</th><th>RO 数据</th><th>RW 数据</th><th>ZI 数据</th><th>总 Flash</th><th>总 RAM</th></tr>
+        </thead>
+        <tbody>
+            {mod_rows}
+        </tbody>
+    </table>
+</div>
+</body>
+</html>"""
 
 
 class MemoryBarWidget(QWidget):
@@ -150,13 +287,13 @@ class MainWindow(QMainWindow):
         screen = QApplication.primaryScreen()
         if screen:
             avail = screen.availableGeometry()
-            w = min(1120, max(840, int(avail.width() * 0.78)))
+            w = min(1140, max(840, int(avail.width() * 0.78)))
             h = min(660, max(500, int(avail.height() * 0.74)))
             self.resize(w, h)
             self.setMinimumSize(800, 480)
             self.move(avail.x() + (avail.width() - w) // 2, avail.y() + (avail.height() - h) // 2)
         else:
-            self.resize(1060, 640)
+            self.resize(1080, 640)
             self.setMinimumSize(800, 480)
 
         self.setAcceptDrops(True)
@@ -192,7 +329,6 @@ class MainWindow(QMainWindow):
         self.btn_reload.setEnabled(False)
         top_layout.addWidget(self.btn_reload)
 
-        # Baseline Diff Buttons
         self.btn_set_baseline = QPushButton("📌 设为基线")
         self.btn_set_baseline.setObjectName("btnSecondary")
         self.btn_set_baseline.setCursor(Qt.PointingHandCursor)
@@ -208,7 +344,14 @@ class MainWindow(QMainWindow):
         self.btn_clear_baseline.setVisible(False)
         top_layout.addWidget(self.btn_clear_baseline)
 
-        # Export Dropdown
+        self.btn_copy_md = QPushButton("📋 复制 Markdown")
+        self.btn_copy_md.setObjectName("btnSecondary")
+        self.btn_copy_md.setCursor(Qt.PointingHandCursor)
+        self.btn_copy_md.setToolTip("一键生成精美 Markdown 内存分析摘要表格并复制到剪贴板，方便直接粘贴到 PR 或群聊中汇报")
+        self.btn_copy_md.clicked.connect(self.copy_markdown_summary)
+        self.btn_copy_md.setEnabled(False)
+        top_layout.addWidget(self.btn_copy_md)
+
         self.btn_export = QPushButton("📤 导出分析 ▾")
         self.btn_export.setObjectName("btnSecondary")
         self.btn_export.setCursor(Qt.PointingHandCursor)
@@ -411,7 +554,7 @@ class MainWindow(QMainWindow):
         title_row.addWidget(lbl_title)
         title_row.addStretch()
 
-        lbl_cap = QLabel("额定:")
+        lbl_cap = QLabel("额定/预算:")
         lbl_cap.setStyleSheet("font-size: 11px; color: #64748b;")
         title_row.addWidget(lbl_cap)
 
@@ -662,6 +805,7 @@ class MainWindow(QMainWindow):
             self.current_data = data
             self.btn_reload.setEnabled(True)
             self.btn_set_baseline.setEnabled(True)
+            self.btn_copy_md.setEnabled(True)
             self.btn_export.setEnabled(True)
 
             entry_str = f", 入口: 0x{data['entry']:08X}" if data.get('entry') else ""
@@ -675,6 +819,8 @@ class MainWindow(QMainWindow):
             # Auto populate capacities
             if data.get('chip_flash_kb'):
                 self.txt_flash_cap.setText(str(data['chip_flash_kb']))
+            self.lbl_flash_sub.setText(data.get('flash_sub_note', ''))
+
             if data.get('chip_internal_ram_kb'):
                 self.txt_ram_int_cap.setText(str(data['chip_internal_ram_kb']))
             self.lbl_ram_int_sub.setText(data.get('ram_int_note', ''))
@@ -822,7 +968,6 @@ class MainWindow(QMainWindow):
         self.tbl_sections.setSortingEnabled(False)
         self.tbl_sections.setRowCount(0)
 
-        # Build baseline section map
         base_sec_map = {}
         if self.baseline_data:
             for s in self.baseline_data.get('sections', []):
@@ -902,7 +1047,6 @@ class MainWindow(QMainWindow):
 
         use_demangle = self.chk_demangle.isChecked()
 
-        # Build baseline symbol map
         base_sym_map = {}
         if self.baseline_data:
             for sym in self.baseline_data.get('symbols', []):
@@ -1072,6 +1216,72 @@ class MainWindow(QMainWindow):
                 self.status.showMessage(f"已复制到剪贴板: {name_item.text()}", 3000)
 
     # -------------------------------------------------------------------------
+    # Copy Markdown Summary
+    # -------------------------------------------------------------------------
+    def copy_markdown_summary(self):
+        if not self.current_data:
+            return
+        d = self.current_data
+        md = []
+        md.append(f"### 📊 固件内存分析摘要: `{d['file_name']}`")
+        ext_badge = f" | **外存**: {d.get('external_ram_name')}" if d.get('has_external_ram') else ""
+        md.append(f"- **目标架构**: {d['arch']}{ext_badge} | **分析时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        md.append("")
+        md.append("| 内存区域 | 当前占用 | 额定/预算上限 | 占用率 | 状态 |")
+        md.append("| :--- | :--- | :--- | :--- | :--- |")
+
+        fl = d.get('flash_total', 0)
+        try:
+            fl_cap_kb = float(self.txt_flash_cap.text().strip() or "0")
+        except ValueError:
+            fl_cap_kb = 0
+        fl_cap_bytes = fl_cap_kb * 1024
+        fl_pct = (fl / fl_cap_bytes * 100) if fl_cap_bytes else 0
+        fl_st = "🔴 已超限" if fl_pct > 100 else ("🟡 紧缺" if fl_pct > 90 else "🟢 正常")
+        diff_fl = ""
+        if self.baseline_data:
+            df = fl - self.baseline_data.get('flash_total', 0)
+            diff_fl = f" ({'+' if df > 0 else ''}{format_bytes(df)})"
+        fl_sub_label = f" ({self.lbl_flash_sub.text()})" if self.lbl_flash_sub.text() else ""
+        md.append(f"| **Flash (ROM)** | {format_bytes(fl)}{diff_fl} | {fl_cap_kb:.0f} KB{fl_sub_label} | {fl_pct:.1f}% | {fl_st} |")
+
+        ram_int = d.get('ram_internal_total', 0)
+        try:
+            ram_int_cap_kb = float(self.txt_ram_int_cap.text().strip() or "0")
+        except ValueError:
+            ram_int_cap_kb = 0
+        ram_int_cap_bytes = ram_int_cap_kb * 1024
+        ram_int_pct = (ram_int / ram_int_cap_bytes * 100) if ram_int_cap_bytes else 0
+        ram_int_st = "🔴 已超限" if ram_int_pct > 100 else ("🟡 紧缺" if ram_int_pct > 90 else "🟢 正常")
+        diff_ram = ""
+        if self.baseline_data:
+            dr = ram_int - self.baseline_data.get('ram_internal_total', 0)
+            diff_ram = f" ({'+' if dr > 0 else ''}{format_bytes(dr)})"
+        ram_sub_label = f" ({self.lbl_ram_int_sub.text()})" if self.lbl_ram_int_sub.text() else ""
+        md.append(f"| **片内 SRAM** | {format_bytes(ram_int)}{diff_ram} | {ram_int_cap_kb:.0f} KB{ram_sub_label} | {ram_int_pct:.1f}% | {ram_int_st} |")
+
+        if d.get('has_external_ram'):
+            ram_ext = d.get('ram_external_total', 0)
+            ext_cap = self.txt_ram_ext_cap.text()
+            ext_st = "🚀 就绪" if ram_ext == 0 else "🟢 已分配"
+            md.append(f"| **片外 RAM** | {format_bytes(ram_ext)} | {ext_cap} KB | - | {ext_st} |")
+
+        md.append("")
+        md.append("<details>")
+        md.append("<summary>🏆 最占内存的 Top 5 函数 / 变量</summary>")
+        md.append("")
+        for i, s in enumerate(d.get('symbols', [])[:5]):
+            name = s.get('demangled_name', s['name'])
+            mod = f" (`{s.get('module')}`)" if s.get('module') else ""
+            md.append(f"{i+1}. `{name}` - **{s['size_str']}** [{s['type']}]{mod}")
+        md.append("")
+        md.append("</details>")
+
+        md_text = "\n".join(md)
+        QApplication.clipboard().setText(md_text)
+        self.status.showMessage("已复制 Markdown 摘要到剪贴板！可以直接粘贴到 PR、Issue 或聊天软件中汇报。", 4000)
+
+    # -------------------------------------------------------------------------
     # Report Export Handlers
     # -------------------------------------------------------------------------
     def export_html(self):
@@ -1082,142 +1292,17 @@ class MainWindow(QMainWindow):
         if not save_path:
             return
 
-        d = self.current_data
-        fl_str = format_bytes(d.get('flash_total', 0))
-        ram_int_str = format_bytes(d.get('ram_internal_total', 0))
-        ram_ext_str = format_bytes(d.get('ram_external_total', 0))
-        fl_pct = self.lbl_flash_pct.text()
-        ram_int_pct = self.lbl_ram_int_pct.text()
-        gen_time = time.strftime("%Y-%m-%d %H:%M:%S")
-
-        # Build Section Table HTML
-        sec_rows = ""
-        for s in d.get('sections', []):
-            sec_rows += f"<tr><td>{s['name']}</td><td>{s.get('category','')}</td><td>{s['address_hex']}</td><td>{s['size']:,}</td><td>{s['size_str']}</td><td>{s.get('flags','')}</td></tr>\n"
-
-        # Build Top 200 Symbols HTML
-        sym_rows = ""
-        for s in d.get('symbols', [])[:250]:
-            name = s.get('demangled_name', s['name'])
-            sym_rows += f"<tr><td>{name}</td><td>{s['type']}</td><td>{s.get('section','')}</td><td>{s.get('module','')}</td><td>{s['address_hex']}</td><td>{s['size']:,}</td><td>{s['size_str']}</td></tr>\n"
-
-        # Build Modules HTML
-        mod_rows = ""
-        for m_name, m in sorted(d.get('modules', {}).items(), key=lambda x: x[1]['flash']+x[1]['ram'], reverse=True):
-            mod_rows += f"<tr><td>{m_name}</td><td>{format_bytes(m['code'])}</td><td>{format_bytes(m['ro_data'])}</td><td>{format_bytes(m['rw_data'])}</td><td>{format_bytes(m['zi_data'])}</td><td><b>{format_bytes(m['flash'])}</b></td><td><b>{format_bytes(m['ram'])}</b></td></tr>\n"
-
-        ext_card_html = ""
-        if d.get('has_external_ram'):
-            ext_name = d.get('external_ram_name', '外扩 RAM')
-            ext_card_html = f"""
-            <div class="card">
-                <div class="card-title">片外 RAM ({ext_name})</div>
-                <div class="card-val val-cyan">{ram_ext_str}</div>
-                <div class="sub">额定: {self.txt_ram_ext_cap.text()} KB | 状态: {self.lbl_ram_ext_sub.text()}</div>
-            </div>
-            """
-
-        html_content = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>固件内存分析报告 - {d['file_name']}</title>
-<style>
-body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: #f8fafc; margin: 24px; color: #1e293b; }}
-.header {{ background: white; border-radius: 8px; border: 1px solid #e2e8f0; padding: 18px 24px; margin-bottom: 20px; }}
-.header h1 {{ margin: 0 0 6px 0; font-size: 22px; color: #0f172a; }}
-.header p {{ margin: 0; font-size: 13px; color: #64748b; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px; }}
-.card {{ background: white; border-radius: 8px; border: 1px solid #e2e8f0; padding: 16px 20px; }}
-.card-title {{ font-size: 13px; font-weight: 600; color: #475569; }}
-.card-val {{ font-size: 26px; font-weight: bold; margin: 8px 0; }}
-.val-blue {{ color: #2563eb; }}
-.val-green {{ color: #059669; }}
-.val-cyan {{ color: #0891b2; }}
-.sub {{ font-size: 11px; color: #64748b; }}
-.panel {{ background: white; border-radius: 8px; border: 1px solid #e2e8f0; padding: 20px; margin-bottom: 24px; }}
-.panel h2 {{ margin: 0 0 12px 0; font-size: 16px; color: #1e293b; }}
-table {{ width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }}
-th, td {{ border: 1px solid #e2e8f0; padding: 7px 10px; text-align: left; }}
-th {{ background: #f1f5f9; font-weight: 600; color: #475569; }}
-tr:nth-child(even) {{ background: #f8fafc; }}
-input.filter-box {{ width: 100%; box-sizing: border-box; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; margin-bottom: 12px; }}
-</style>
-<script>
-function filterTable(inputId, tableId) {{
-    var input = document.getElementById(inputId);
-    var filter = input.value.toLowerCase();
-    var rows = document.querySelectorAll('#' + tableId + ' tbody tr');
-    rows.forEach(function(row) {{
-        row.style.display = row.textContent.toLowerCase().includes(filter) ? '' : 'none';
-    }});
-}}
-</script>
-</head>
-<body>
-<div class="header">
-    <h1>📊 嵌入式固件内存分析报告: {d['file_name']}</h1>
-    <p>文件类型: {d['file_type']} | 目标架构: {d['arch']} | 生成时间: {gen_time}</p>
-    <p style="margin-top:4px; font-size:11px; color:#94a3b8;">源路径: {d['file_path']}</p>
-</div>
-
-<div class="grid">
-    <div class="card">
-        <div class="card-title">Flash (ROM 固件占用)</div>
-        <div class="card-val val-blue">{fl_str}</div>
-        <div class="sub">额定: {self.txt_flash_cap.text()} KB | 占用率: <b>{fl_pct}</b></div>
-    </div>
-    <div class="card">
-        <div class="card-title">片内 SRAM (Internal RAM)</div>
-        <div class="card-val val-green">{ram_int_str}</div>
-        <div class="sub">额定: {self.txt_ram_int_cap.text()} KB | 占用率: <b>{ram_int_pct}</b> {self.lbl_ram_int_sub.text()}</div>
-    </div>
-    {ext_card_html}
-</div>
-
-<div class="panel">
-    <h2>📌 内存段构成 (Sections)</h2>
-    <input type="text" id="secInput" class="filter-box" onkeyup="filterTable('secInput', 'secTable')" placeholder="🔍 快速搜索段名称 (如 .text, .data, bss)...">
-    <table id="secTable">
-        <thead>
-            <tr><th>段名称 (Section)</th><th>内存归属类别</th><th>虚拟地址 (VMA)</th><th>大小 (字节)</th><th>格式化大小</th><th>属性 Flags</th></tr>
-        </thead>
-        <tbody>
-            {sec_rows}
-        </tbody>
-    </table>
-</div>
-
-<div class="panel">
-    <h2>🏆 符号体积排行榜 Top 250 (Symbols)</h2>
-    <input type="text" id="symInput" class="filter-box" onkeyup="filterTable('symInput', 'symTable')" placeholder="🔍 快速搜索函数名或全局变量名...">
-    <table id="symTable">
-        <thead>
-            <tr><th>符号名称 (Symbol)</th><th>类型</th><th>所属段</th><th>所属模块 / 源文件</th><th>地址 (VMA)</th><th>大小 (字节)</th><th>格式化大小</th></tr>
-        </thead>
-        <tbody>
-            {sym_rows}
-        </tbody>
-    </table>
-</div>
-
-<div class="panel">
-    <h2>📦 模块与源文件分析 (Modules)</h2>
-    <input type="text" id="modInput" class="filter-box" onkeyup="filterTable('modInput', 'modTable')" placeholder="🔍 快速搜索模块名称...">
-    <table id="modTable">
-        <thead>
-            <tr><th>目标模块 / 源文件</th><th>Code 代码</th><th>RO 数据</th><th>RW 数据</th><th>ZI 数据</th><th>总 Flash</th><th>总 RAM</th></tr>
-        </thead>
-        <tbody>
-            {mod_rows}
-        </tbody>
-    </table>
-</div>
-
-</body>
-</html>
-"""
+        html_content = generate_html_content(
+            self.current_data,
+            self.txt_flash_cap.text(),
+            self.txt_ram_int_cap.text(),
+            self.txt_ram_ext_cap.text(),
+            self.lbl_flash_pct.text(),
+            self.lbl_ram_int_pct.text(),
+            self.lbl_flash_sub.text(),
+            self.lbl_ram_int_sub.text(),
+            self.lbl_ram_ext_sub.text()
+        )
         try:
             with open(save_path, 'w', encoding='utf-8') as f:
                 f.write(html_content)
@@ -1272,7 +1357,147 @@ function filterTable(inputId, tableId) {{
             QMessageBox.critical(self, "导出失败", f"导出 JSON 失败: {e}")
 
 
+def handle_cli_mode(argv: List[str]):
+    """Run in Headless CLI Mode without creating a Qt window. Suitable for CI/CD."""
+    parser = argparse.ArgumentParser(
+        prog="FirmwareMemoryVisualizer",
+        description="嵌入式固件内存分析器 CLI 模式 (Headless / CI / CD)"
+    )
+    parser.add_argument("file", nargs="?", help="待分析的固件文件 (.elf / .axf / .out / .map)")
+    parser.add_argument("--cli", action="store_true", help="启用无头 CLI 模式输出")
+    parser.add_argument("--max-flash", type=float, help="设置 Flash 允许的最大预算上限 (KB)")
+    parser.add_argument("--max-ram", type=float, help="设置片内 SRAM 允许的最大预算上限 (KB)")
+    parser.add_argument("--diff", help="指定对比基线固件进行增减分析")
+    parser.add_argument("--json", action="store_true", help="输出全量结构化 JSON 数据到标准输出")
+    parser.add_argument("--export-html", help="直接输出 HTML 报告到指定文件路径")
+    parser.add_argument("--export-csv", help="直接输出 CSV 报表到指定文件路径")
+
+    args = parser.parse_args(argv[1:])
+
+    if not args.file:
+        parser.print_help()
+        sys.exit(0)
+
+    if not os.path.exists(args.file):
+        print(f"[ERROR] 文件不存在: {args.file}", file=sys.stderr)
+        sys.exit(1)
+
+    data = FirmwareParser.parse_file(args.file)
+    baseline_data = FirmwareParser.parse_file(args.diff) if (args.diff and os.path.exists(args.diff)) else None
+
+    # Handle JSON output
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        sys.exit(0)
+
+    # Handle HTML export
+    if args.export_html:
+        html_code = generate_html_content(
+            data,
+            str(data.get('chip_flash_kb', 512)),
+            str(data.get('chip_internal_ram_kb', 128)),
+            str(data.get('chip_external_ram_kb', 8192)),
+            f"{(data.get('flash_total', 0)/(data.get('chip_flash_kb', 512)*1024))*100:.1f}%",
+            f"{(data.get('ram_internal_total', 0)/(data.get('chip_internal_ram_kb', 128)*1024))*100:.1f}%",
+            data.get('flash_sub_note', ''),
+            data.get('ram_int_note', ''),
+            f"【{data.get('external_ram_name','外存')} 已就绪】" if data.get('has_external_ram') else ''
+        )
+        with open(args.export_html, 'w', encoding='utf-8') as f:
+            f.write(html_code)
+        print(f"[SUCCESS] HTML 报告已导出至: {args.export_html}")
+
+    # Handle CSV export
+    if args.export_csv:
+        with open(args.export_csv, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            writer.writerow(["排名", "符号名称", "C++还原名", "类型", "所属段", "所属模块/源文件", "虚拟地址", "大小(字节)", "格式化大小"])
+            for i, sym in enumerate(data.get('symbols', [])):
+                writer.writerow([
+                    i + 1,
+                    sym['name'],
+                    sym.get('demangled_name', sym['name']),
+                    sym['type'],
+                    sym.get('section', ''),
+                    sym.get('module', ''),
+                    sym['address_hex'],
+                    sym['size'],
+                    sym['size_str']
+                ])
+        print(f"[SUCCESS] CSV 报表已导出至: {args.export_csv}")
+
+    fl = data.get('flash_total', 0)
+    ram_int = data.get('ram_internal_total', 0)
+    ram_ext = data.get('ram_external_total', 0)
+
+    fl_cap_kb = args.max_flash or data.get('chip_flash_kb', 512)
+    ram_cap_kb = args.max_ram or data.get('chip_internal_ram_kb', 128)
+
+    fl_pct = (fl / (fl_cap_kb * 1024)) * 100 if fl_cap_kb else 0
+    ram_pct = (ram_int / (ram_cap_kb * 1024)) * 100 if ram_cap_kb else 0
+
+    print("=" * 72)
+    print("  Firmware Memory Visualizer (CLI Mode)")
+    print("=" * 72)
+    print(f"File:       {data['file_name']} ({data['file_type']})")
+    print(f"Target:     {data['arch']} | Entry: 0x{data.get('entry', 0):08X}")
+    if data.get('flash_sub_note'):
+        print(f"Flash Note: {data.get('flash_sub_note')}")
+    if data.get('ram_int_note'):
+        print(f"RAM Note:   {data.get('ram_int_note')}")
+    if data.get('has_external_ram'):
+        print(f"Ext RAM:    {data.get('external_ram_name')}")
+    print("-" * 72)
+
+    # Flash check
+    fl_overflow = fl > fl_cap_kb * 1024
+    fl_status = "FAIL [OVERFLOW]" if fl_overflow else "PASS"
+    diff_fl_str = ""
+    if baseline_data:
+        d = fl - baseline_data.get('flash_total', 0)
+        diff_fl_str = f" [Diff: {'+' if d > 0 else ''}{format_bytes(d)}]"
+    print(f"Flash:      {format_bytes(fl):>10} ({fl:,} B) / {fl_cap_kb:.0f} KB ({fl_pct:5.1f}%){diff_fl_str} [{fl_status}]")
+
+    # RAM check
+    ram_overflow = ram_int > ram_cap_kb * 1024
+    ram_status = "FAIL [OVERFLOW]" if ram_overflow else "PASS"
+    diff_ram_str = ""
+    if baseline_data:
+        d = ram_int - baseline_data.get('ram_internal_total', 0)
+        diff_ram_str = f" [Diff: {'+' if d > 0 else ''}{format_bytes(d)}]"
+    print(f"SRAM:       {format_bytes(ram_int):>10} ({ram_int:,} B) / {ram_cap_kb:.0f} KB ({ram_pct:5.1f}%){diff_ram_str} [{ram_status}]")
+
+    if data.get('has_external_ram'):
+        print(f"Ext RAM:    {format_bytes(ram_ext):>10} ({ram_ext:,} B) / {data.get('chip_external_ram_kb', 8192)} KB (Ready)")
+
+    print("-" * 72)
+    print("Top 5 Symbols:")
+    for i, s in enumerate(data.get('symbols', [])[:5]):
+        name = s.get('demangled_name', s['name'])
+        mod = f" ({s.get('module')})" if s.get('module') else ""
+        print(f"  {i+1}. {name:<36} {s['size_str']:>9} [{s['type']}]{mod}")
+    print("=" * 72)
+
+    if fl_overflow or ram_overflow:
+        reasons = []
+        if fl_overflow:
+            reasons.append(f"Flash ({format_bytes(fl)}) 超出预算 ({fl_cap_kb:.0f} KB)")
+        if ram_overflow:
+            reasons.append(f"SRAM ({format_bytes(ram_int)}) 超出预算 ({ram_cap_kb:.0f} KB)")
+        print(f"RESULT: FAILED! {', '.join(reasons)}")
+        sys.exit(1)
+    else:
+        print(f"RESULT: PASSED! 内存占用在预算范围内。")
+        sys.exit(0)
+
+
 def main():
+    # Check for Headless CLI mode arguments first
+    cli_flags = ['--cli', '-c', '--json', '--export-html', '--export-csv', '--help', '-h', '--max-flash', '--max-ram']
+    if any(arg in sys.argv for arg in cli_flags):
+        handle_cli_mode(sys.argv)
+        return
+
     if sys.platform == 'win32':
         try:
             import ctypes
